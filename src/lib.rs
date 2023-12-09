@@ -3,19 +3,15 @@
 //! Newtype around heapless byte Vec with efficient serde.
 
 #![cfg_attr(not(test), no_std)]
+#![allow(clippy::result_unit_err)]
 
 use core::{
     cmp::Ordering,
     fmt::{self, Debug},
     hash::{Hash, Hasher},
-    marker::PhantomData,
     ops::{Deref, DerefMut},
     ptr,
 };
-
-// bring trait in scope to use `consts::Uxx::USIZE` etc.,
-// to get the corresponding size of Bytes.
-pub use typenum::{IsGreaterOrEqual, True, Unsigned};
 
 use heapless::Vec;
 
@@ -87,11 +83,6 @@ impl<const N: usize> Bytes<N> {
         Bytes::<M>::from_slice(self)
     }
 
-    // #[doc(hidden)]
-    // pub fn into_iter(self) -> <Vec<u8, N> as IntoIterator>::IntoIter {
-    //     self.bytes.into_iter()
-    // }
-
     // pub fn try_from_slice(slice: &[u8]) -> core::result::Result<Self, ()> {
     //     let mut bytes = Vec::<u8, N>::new();
     //     bytes.extend_from_slice(slice)?;
@@ -112,10 +103,8 @@ impl<const N: usize> Bytes<N> {
     ///
     /// It seems it's not possible to do this as an actual `TryFrom` implementation.
     pub fn try_from<E>(
-        f: impl FnOnce(&mut [u8]) -> core::result::Result<usize, E>
-    )
-        -> core::result::Result<Self, E>
-    {
+        f: impl FnOnce(&mut [u8]) -> core::result::Result<usize, E>,
+    ) -> core::result::Result<Self, E> {
         let mut data = Self::new();
         data.resize_to_capacity();
         let result = f(&mut data);
@@ -173,7 +162,7 @@ impl<const N: usize> Bytes<N> {
 
     pub(crate) unsafe fn remove_unchecked(&mut self, index: usize) -> u8 {
         // the place we are taking from.
-        let p = (self.bytes.as_mut_ptr() as *mut u8).add(index);
+        let p = self.bytes.as_mut_ptr().add(index);
 
         // copy it out, unsafely having a copy of the value on
         // the stack and in the vector at the same time.
@@ -194,32 +183,10 @@ impl<const N: usize> Bytes<N> {
         self.bytes.resize_default(self.bytes.capacity()).ok();
     }
 
-    // /// Clone into at least same size byte buffer.
-    // pub fn to_bytes<M>(&self) -> Bytes<M>
-    // where
-    //     M: ArrayLength<u8> + IsGreaterOrEqual<N, Output = True>,
-    // {
-    //     match Bytes::<M>::try_from_slice(self) {
-    //         Ok(byte_buf) => byte_buf,
-    //         _ => unreachable!(),
-    //     }
-    // }
-
     /// Fallible conversion into differently sized byte buffer.
-    pub fn to_bytes<const M: usize>(&self) -> Result<Bytes<M>, ()>
-    {
+    pub fn to_bytes<const M: usize>(&self) -> Result<Bytes<M>, ()> {
         Bytes::<M>::from_slice(self)
     }
-
-    // /// Fallible conversion into differently sized byte buffer.
-    // pub fn try_to_bytes<const M: usize>(&self) -> Result<Bytes<M>, ()>
-    // {
-    //     Bytes::<M>::from_slice(self)
-    // }
-
-    // pub fn deref_mut(&mut self) -> &mut [u8] {
-    //     self.bytes.deref_mut()
-    // }
 
     #[cfg(feature = "cbor")]
     pub fn from_serialized<T>(t: &T) -> Self
@@ -271,11 +238,7 @@ impl<const N: usize> Debug for Bytes<N> {
         use core::ascii::escape_default;
         f.write_str("b'")?;
         for byte in &self.bytes {
-            for ch in escape_default(*byte) {
-                // Debug::fmt(unsafe { core::str::from_utf8_unchecked(&[ch]) }, f)?;
-                f.write_str(unsafe { core::str::from_utf8_unchecked(&[ch]) })?;
-                // f.write(&ch);
-            }
+            write!(f, "{}", escape_default(*byte))?;
         }
         f.write_str("'")?;
         Ok(())
@@ -371,8 +334,7 @@ impl<'a, const N: usize> IntoIterator for &'a mut Bytes<N> {
     }
 }
 
-impl<const N: usize> Serialize for Bytes<N>
-{
+impl<const N: usize> Serialize for Bytes<N> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -382,17 +344,14 @@ impl<const N: usize> Serialize for Bytes<N>
 }
 
 // TODO: can we delegate to Vec<u8, N> deserialization instead of reimplementing?
-impl<'de, const N: usize> Deserialize<'de> for Bytes<N>
-{
+impl<'de, const N: usize> Deserialize<'de> for Bytes<N> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        struct ValueVisitor<'de, const N: usize>(PhantomData<&'de ()>);
+        struct ValueVisitor<const N: usize>;
 
-        impl<'de, const N: usize> Visitor<'de> for ValueVisitor<'de, N>
-        {
-            // type Value = Vec<T, N>;
+        impl<'de, const N: usize> Visitor<'de> for ValueVisitor<N> {
             type Value = Bytes<N>;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -422,7 +381,42 @@ impl<'de, const N: usize> Deserialize<'de> for Bytes<N>
             }
         }
 
-        deserializer.deserialize_bytes(ValueVisitor(PhantomData))
+        deserializer.deserialize_bytes(ValueVisitor)
+    }
+}
+
+#[cfg(test)]
+mod tests_serde {
+    use super::*;
+    use serde_test::{assert_tokens, Token};
+
+    #[test]
+    fn serde() {
+        let mut bytes = Bytes::<0>::new();
+        assert!(bytes.push(1).is_err());
+        assert_tokens(&bytes, &[Token::Bytes(&[])]);
+
+        let mut bytes = Bytes::<16>::new();
+        bytes.push(1).unwrap();
+        assert_tokens(&bytes, &[Token::Bytes(&[1])]);
+        assert!(bytes.extend_from_slice(&[2; 16]).is_err());
+        assert_eq!(&**bytes, &[1]);
+        assert!(bytes.extend_from_slice(&[2; 15]).is_ok());
+        assert_eq!(&**bytes, &[1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]);
+        assert_tokens(
+            &bytes,
+            &[Token::Bytes(&[
+                1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+            ])],
+        );
+    }
+
+    #[test]
+    fn display() {
+        assert_eq!(
+            r"b'\x00abcde\n'",
+            format!("{:?}", Bytes::<10>::from_slice(b"\0abcde\n").unwrap())
+        );
     }
 }
 
@@ -430,7 +424,6 @@ impl<'de, const N: usize> Deserialize<'de> for Bytes<N>
 #[cfg(feature = "cbor")]
 mod tests {
     use super::*;
-    use heapless::consts;
 
     #[test]
     fn test_client_data_hash() {
@@ -439,8 +432,7 @@ mod tests {
             0x44, 0x45, 0x46,
         ];
 
-        let client_data_hash: Bytes<consts::U32> =
-            serde_cbor::de::from_mut_slice(&mut minimal).unwrap();
+        let client_data_hash: Bytes<17> = serde_cbor::de::from_mut_slice(&mut minimal).unwrap();
 
         assert_eq!(client_data_hash, b"1234567890ABCDEF");
     }
